@@ -160,6 +160,7 @@ end = struct
   let make grant = { grant; blocks = []; shutdown = false; in_use = 0 }
 
   let shutdown t =
+    printf "Netif.Shared_page_pool.shutdown\n%!";
     t.shutdown <- true;
     if t.in_use = 0 then (
       t.blocks |> List.iter (fun (gref, block) ->
@@ -173,6 +174,7 @@ end = struct
     (* Otherwise, shutdown gets called again when in_use becomes 0 *)
 
   let alloc t =
+    printf "Netif.Shared_page_pool.alloc\n%!";
     let page = Io_page.get 1 in
     (* (the Xen version of caml_alloc_pages clears the page, so we don't have to) *)
     lwt gnt = Gnt.Gntshr.get () in
@@ -180,11 +182,13 @@ end = struct
     return (gnt, Io_page.to_cstruct page)
 
   let put t block =
+    printf "Netif.Shared_page_pool.put\n%!";
     t.blocks <- block :: t.blocks;
     t.in_use <- t.in_use - 1;
     if t.in_use = 0 && t.shutdown then shutdown t
 
   let use t fn =
+    printf "Netif.Share_page_pool.use\n%!";
     if t.shutdown then
       failwith "Shared_page_pool.use after shutdown";
     lwt (gntref, block) as grant =
@@ -264,6 +268,7 @@ let h = Eventchn.init ()
 
 (* Given a VIF ID and backend domid, construct a netfront record for it *)
 let plug_inner id =
+  printf "Netif.plug_inner %d\n%!" id;
   lwt xsc = Xs.make () in
   lwt backend_id =
     Xs.(immediate xsc 
@@ -315,8 +320,8 @@ let plug_inner id =
       return { sg; gso_tcpv4; rx_copy; rx_flip; smart_poll }
     )) in
   let rx_map = Hashtbl.create 1 in
-  Printf.printf " sg:%b gso_tcpv4:%b rx_copy:%b rx_flip:%b smart_poll:%b\n"
-    features.sg features.gso_tcpv4 features.rx_copy features.rx_flip features.smart_poll;
+  Printf.printf "Netif.plug_inner: id:%d sg:%b gso_tcpv4:%b rx_copy:%b rx_flip:%b smart_poll:%b\n"
+    id features.sg features.gso_tcpv4 features.rx_copy features.rx_flip features.smart_poll;
   Eventchn.unmask h evtchn;
   let stats = { rx_pkts=0l;rx_bytes=0L;tx_pkts=0l;tx_bytes=0L } in
   let grant_tx_page = Gnt.Gntshr.grant_access ~domid:backend_id ~writable:false in
@@ -345,9 +350,11 @@ let enumerate () =
     return []
 
 let notify nf () =
+  printf "Netif.notify\n%!";
   Eventchn.notify h nf.evtchn
 
 let refill_requests nf =
+  printf "Netif.refill_requests\n%!";
   let num = Ring.Rpc.Front.get_free_requests nf.rx_fring in
   if num > 0 then
     lwt grefs = Gnt.Gntshr.get_n num in
@@ -368,6 +375,7 @@ let refill_requests nf =
 
 let rx_poll nf (fn: Cstruct.t -> unit Lwt.t) =
   MProf.Trace.label "Netif.rx_poll";
+  printf "Netif.rx_poll\n%!";
   Ring.Rpc.Front.ack_responses nf.rx_fring (fun slot ->
       let id,(offset,flags,status) = RX.Proto_64.read slot in
       let gref, page = Hashtbl.find nf.rx_map id in
@@ -387,10 +395,12 @@ let rx_poll nf (fn: Cstruct.t -> unit Lwt.t) =
 
 let tx_poll nf =
   MProf.Trace.label "Netif.tx_poll";
+  printf "Netif.tx_poll\n%!";
   Lwt_ring.Front.poll nf.tx_client TX.Proto_64.read
 
 let poll_thread (nf: t) : unit Lwt.t =
   let rec loop from =
+    printf "Netfif.poll_thread:loop\n%!";
     rx_poll nf.t nf.receive_callback;
     refill_requests nf.t >>= fun () ->
     tx_poll nf.t;
@@ -424,7 +434,7 @@ let connect id =
           let l = Lwt_mutex.create () in
           let c = Lwt_condition.create () in
           (* packets are dropped until listen is called *)
-          let receive_callback = fun _ -> return () in
+          let receive_callback = fun _ -> printf "DROP!!!!\n%!"; return () in
           let dev = { t; resume_fns=[]; receive_callback; l; c } in
           let (_: unit Lwt.t) = poll_thread dev in
           Hashtbl.add devices id' dev;
@@ -443,7 +453,7 @@ let connect id =
 (* Unplug shouldn't block, although the Xen one might need to due
    to Xenstore? XXX *)
 let disconnect t =
-  printf "Netif: disconnect\n%!";
+  printf "Netif.disconnect\n%!";
   Shared_page_pool.shutdown t.t.tx_pool;
   Hashtbl.remove devices t.t.id;
   return ()
@@ -467,34 +477,44 @@ let blitv src dst =
         ) in
   aux dst 0 src
 
+let mk_id = let c = ref 0 in fun () -> incr c; !c
+
 (* Push up to one page's worth of data to the ring, but without sending an
  * event notification. Once the data has been added to the ring, returns the
  * remaining (unsent) data and a thread which will return when the data has
  * been ack'd by netback. *)
 let write_request ?size ~flags nf datav =
+  lwt all = enumerate () in
+  let id = mk_id () in
+  printf "Netif.write_request id=%d available-devices: [%s])\n%!" 
+    id (String.concat ", " all);
   Shared_page_pool.use nf.t.tx_pool (fun gref shared_block ->
     let len, datav = blitv datav shared_block in
     (* [size] includes extra pages to follow later *)
     let size = match size with |None -> len |Some s -> s in
+    printf "Netif.write_request: id=%d len=%d size=%d\n%!" id len size;
     nf.t.stats.tx_pkts <- Int32.succ nf.t.stats.tx_pkts;
     nf.t.stats.tx_bytes <- Int64.add nf.t.stats.tx_bytes (Int64.of_int size);
     lwt replied = Lwt_ring.Front.write nf.t.tx_client
         (TX.Proto_64.write ~id:gref ~gref:(Int32.of_int gref) ~offset:shared_block.Cstruct.off ~flags ~size) in
     (* request has been written; when replied returns we have a reply *)
-    let release = replied >>= fun _ -> return () in
+    let release = replied >>= fun _ -> printf "Netif.write_request: id=%d Lwt_ring.Front.write done!\n%!" id; return () in
     return (datav, release)
   )
 
 (* Transmit a packet from buffer, with offset and length.
  * The buffer's data must fit in a single block. *)
 let write_already_locked nf datav =
+  printf "Netif.write_already_locked\n%!";
   lwt remaining, th = write_request ~flags:0 nf datav in
   assert (Cstruct.lenv remaining = 0);
   Lwt_ring.Front.push nf.t.tx_client (notify nf.t);
+  printf "Netfi.write_already_locked: Front.push done\n%!";
   return th
 
 (* Transmit a packet from a list of pages *)
 let writev_no_retry nf datav =
+  printf "Netif.writev_no_retry\n%!";
   let size = Cstruct.lenv datav in
   let numneeded = Shared_page_pool.blocks_needed size in
   Lwt_mutex.with_lock nf.t.tx_mutex
@@ -528,6 +548,7 @@ let writev_no_retry nf datav =
     )
 
 let rec writev nf datav =
+  printf "Netif.writev\n%!";
   lwt released =
     try_lwt writev_no_retry nf datav
     with Lwt_ring.Shutdown -> return (fail Lwt_ring.Shutdown) in
@@ -540,14 +561,15 @@ let rec writev nf datav =
 let write nf data = writev nf [data]
 
 let wait_for_plug nf =
-  Printf.printf "Wait for plug...\n";
   Lwt_mutex.with_lock nf.l (fun () ->
       while_lwt not (Eventchn.is_valid nf.t.evtchn) do
+        Printf.printf "Netif.wait_for_plug\n%!";
         MProf.Trace.label "Netif.wait_for_plug";
         Lwt_condition.wait ~mutex:nf.l nf.c
       done)
 
 let listen nf fn =
+  printf "Netif.listen\n%!";
   (* packets received from this point on will go to [fn]. Historical
      packets have not been stored: we don't want to buffer the network *)
   nf.receive_callback <- fn;
